@@ -1,11 +1,14 @@
 """Detection signals for Provenance Guard.
 
-Milestone 3 implements Signal 1 (LLM classifier via Groq). Signal 2 (stylometric
-heuristics) is specified in planning.md and lands in Milestone 4.
+Signal 1: LLM classifier via Groq (semantic/stylistic).
+Signal 2: stylometric heuristics in pure Python (structural).
+Both return {"ai_likelihood": float in [0,1], ...}. See planning.md.
 """
 
 import os
+import re
 import json
+import statistics
 
 from groq import Groq
 
@@ -63,21 +66,122 @@ def groq_signal(text: str) -> dict:
         }
 
 
+# --------------------------------------------------------------------------- #
+# Signal 2 — stylometric heuristics (pure Python, structural)
+# --------------------------------------------------------------------------- #
+_SENTENCE_SPLIT = re.compile(r"[.!?]+(?:\s|$)")
+_WORD = re.compile(r"[A-Za-z']+")
+_RICH_PUNCT = set(",;:—–-()\"'!?…")
+
+
+def _split_sentences(text: str) -> list:
+    parts = [s.strip() for s in _SENTENCE_SPLIT.split(text) if s.strip()]
+    return parts
+
+
+def stylometric_signal(text: str) -> dict:
+    """Signal 2: measure structural uniformity and return an AI-likelihood.
+
+    Combines three metrics, each mapped to an AI-likelihood contribution in
+    [0,1] (higher = more AI-like), then averaged:
+      - burstiness: coefficient of variation of sentence length. Humans vary a
+        lot (high CV); AI is uniform (low CV). Low CV -> higher AI.
+      - type-token ratio over a 100-word window: lexical diversity. AI tends to
+        sit in a smooth mid range; very low diversity reads AI-ish.
+      - punctuation variety: distinct "rich" punctuation types. Humans use a
+        wider, messier range; AI leans on a narrow set. Low variety -> higher AI.
+
+    Returns {"ai_likelihood": float, "features": {...}, "ok": bool}. `ok` is
+    False when the text is too short (< 3 sentences) for the metrics to be
+    reliable; the caller down-weights the signal in that case.
+    """
+    words = _WORD.findall(text.lower())
+    sentences = _split_sentences(text)
+    n_words = len(words)
+    n_sentences = len(sentences)
+
+    # --- burstiness: coefficient of variation of sentence length (in words) ---
+    sent_lengths = [len(_WORD.findall(s)) for s in sentences] or [n_words]
+    mean_len = statistics.mean(sent_lengths) if sent_lengths else 0.0
+    if len(sent_lengths) >= 2 and mean_len > 0:
+        cv = statistics.pstdev(sent_lengths) / mean_len
+    else:
+        cv = 0.5  # unknown -> neutral-ish
+    # CV ~0 (uniform) -> 1.0 AI; CV >=0.7 (bursty/human) -> 0.0
+    ai_burstiness = _clamp(1.0 - (cv / 0.7))
+
+    # --- type-token ratio over a fixed 100-word window ---
+    window = words[:100]
+    ttr = (len(set(window)) / len(window)) if window else 0.0
+    # TTR >=0.85 (very diverse) -> human (0); TTR <=0.45 (repetitive) -> AI (1)
+    ai_ttr = _clamp((0.85 - ttr) / 0.40)
+
+    # --- punctuation variety ---
+    distinct_punct = len({ch for ch in text if ch in _RICH_PUNCT})
+    # 0-1 distinct types -> AI (1); >=5 distinct types -> human (0)
+    ai_punct = _clamp(1.0 - (distinct_punct / 5.0))
+
+    ai_likelihood = _clamp(
+        0.5 * ai_burstiness + 0.2 * ai_ttr + 0.3 * ai_punct
+    )
+
+    return {
+        "ai_likelihood": round(ai_likelihood, 4),
+        "features": {
+            "n_words": n_words,
+            "n_sentences": n_sentences,
+            "sentence_length_cv": round(cv, 4),
+            "mean_sentence_length": round(mean_len, 2),
+            "type_token_ratio": round(ttr, 4),
+            "distinct_punctuation": distinct_punct,
+            "component_scores": {
+                "burstiness": round(ai_burstiness, 4),
+                "ttr": round(ai_ttr, 4),
+                "punctuation": round(ai_punct, 4),
+            },
+        },
+        "ok": n_sentences >= 3,
+    }
+
+
 if __name__ == "__main__":
-    # Quick standalone test — call the signal directly before wiring the route.
+    # Quick standalone test — call each signal directly before wiring the route.
     from dotenv import load_dotenv
 
     load_dotenv()
     samples = {
-        "human-ish": (
-            "Ugh, the bus was late again so I just walked. Rained the whole way, "
-            "of course. Got a coffee to make up for it — worth it, barely."
+        "clear_ai": (
+            "Artificial intelligence represents a transformative paradigm shift in "
+            "modern society. It is important to note that while the benefits of AI "
+            "are numerous, it is equally essential to consider the ethical "
+            "implications. Furthermore, stakeholders across various sectors must "
+            "collaborate to ensure responsible deployment."
         ),
-        "ai-ish": (
-            "In today's fast-paced world, effective time management is essential. "
-            "By prioritizing tasks and setting clear goals, individuals can enhance "
-            "productivity and achieve a healthy work-life balance."
+        "clear_human": (
+            "ok so i finally tried that new ramen place downtown and honestly? "
+            "underwhelming. the broth was fine but they put WAY too much sodium in "
+            "it and i was thirsty for like three hours after. my friend got the "
+            "spicy version and said it was better. probably won't go back unless "
+            "someone drags me there"
+        ),
+        "borderline_formal_human": (
+            "The relationship between monetary policy and asset price inflation has "
+            "been extensively studied in the literature. Central banks face a "
+            "fundamental tension between their mandate for price stability and the "
+            "unintended consequences of prolonged low interest rates on equity and "
+            "real estate valuations."
+        ),
+        "borderline_edited_ai": (
+            "I've been thinking a lot about remote work lately. There are genuine "
+            "tradeoffs — flexibility and no commute on one side, isolation and "
+            "blurred work-life boundaries on the other. Studies show productivity "
+            "varies widely by individual and role type."
         ),
     }
     for name, sample in samples.items():
-        print(name, "->", groq_signal(sample))
+        s1 = groq_signal(sample)
+        s2 = stylometric_signal(sample)
+        print(f"\n=== {name} ===")
+        print(f"  signal1 (llm)   : {s1['ai_likelihood']:.3f}  ({s1['rationale']})")
+        print(f"  signal2 (stylo) : {s2['ai_likelihood']:.3f}  "
+              f"ok={s2['ok']} comp={s2['features']['component_scores']}")

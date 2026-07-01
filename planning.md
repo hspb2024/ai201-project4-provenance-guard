@@ -79,16 +79,28 @@ if the LLM call fails).
 
 ## 3. Uncertainty Representation (Spec Question 2)
 
-- `ai_likelihood ∈ [0,1]` is the system's estimate that the text is AI-generated.
-- **`confidence`** reported to the user = `certainty`, defined as how far the score
-  sits from the maximally-uncertain midpoint:
-  `certainty = 2 * abs(ai_likelihood − 0.5)` (0 at 0.5, 1.0 at the extremes).
-  A score of **0.6** therefore means "leans AI, but only `certainty = 0.2` — barely
-  above a coin flip," which is exactly the honest thing to tell a user.
+- **`confidence` = the combined `ai_likelihood ∈ [0,1]`** — the system's single
+  estimate that the text is AI-generated. This is the number the audit log stores
+  and the labels are keyed to. A `confidence` of **0.6** means "our combined signal
+  leans AI, but only slightly — it sits inside the uncertain band, so we won't make a
+  firm claim." (See the divergence note in the README: an earlier draft of this spec
+  defined `confidence` as `certainty`; it was changed to the combined likelihood so
+  one number both maps to labels and matches the audit-log example.)
+- **`certainty` = `2 * abs(confidence − 0.5)`** is reported as a *secondary*
+  transparency measure — how far the result sits from a coin flip (0 at 0.5, 1.0 at
+  the extremes). It is what makes the "uncertain" label honest.
+- **Combining the two signals into `confidence`:**
+  - Normal case: `confidence = 0.6 * llm + 0.4 * stylo`.
+  - If the LLM signal fails (`ok = False`): fall back to stylometry alone.
+  - If stylometry is unreliable (`ok = False`, i.e. < 3 sentences): down-weight it
+    to 0.15 and renormalize, so the LLM carries the call.
+  - **Short-text penalty:** if the text has < 3 sentences or < 40 words, pull
+    `confidence` toward 0.5 (`0.5 + (raw − 0.5) * 0.6`) so thin evidence lands in
+    `uncertain` rather than a confident extreme.
 - **Thresholds (attribution buckets):**
-  - `ai_likelihood ≥ 0.65` → **likely_ai**
-  - `0.35 < ai_likelihood < 0.65` → **uncertain**
-  - `ai_likelihood ≤ 0.35` → **likely_human**
+  - `confidence ≥ 0.65` → **likely_ai**
+  - `0.35 < confidence < 0.65` → **uncertain**
+  - `confidence ≤ 0.35` → **likely_human**
 - These are deliberately *not* a binary flip at 0.5. The wide `uncertain` band
   (0.35–0.65) is where borderline scores like 0.6 land, so a marginal result never
   masquerades as a firm accusation.
@@ -119,16 +131,19 @@ Three variants, each keyed to the attribution bucket. `{pct}` is
 ## 5. Appeals Workflow (Spec Question 4)
 
 - **Who:** the creator of a submission, identified by the `content_id` they received.
-- **What they provide:** `POST /appeal` with `{ content_id, creator_id, reason }`.
+- **What they provide:** `POST /appeal` with `{ content_id, creator_reasoning }`
+  (`creator_id` optional).
 - **What the system does:**
   1. Looks up the record by `content_id` (404 if unknown).
-  2. Sets that record's `status` from `classified` → `appealed`, stores the reason.
+  2. Sets that record's `status` from `classified` → `under_review` and stores the
+     `appeal_reasoning`.
   3. Writes a new audit-log entry (`event: "appeal"`) so the original classification
      row is preserved and the appeal is an additional, timestamped fact.
-  4. Returns the updated status to the creator.
-- **Reviewer view (`GET /appeals`):** the queue of records with `status = appealed`,
-  each showing content id, creator id, original attribution + scores, the appeal
-  reason, and timestamps — everything a human needs to overturn or uphold the call.
+  4. Returns a confirmation that the appeal was received.
+- **Reviewer view (`GET /appeals`):** the queue of records with
+  `status = under_review`, each showing content id, creator id, original attribution
+  + both signal scores, the appeal reasoning, and timestamps — everything a human
+  needs to overturn or uphold the call.
 
 ---
 
