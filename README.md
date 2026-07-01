@@ -318,3 +318,5 @@ planning.md       Architecture + full spec (Milestones 1–2)
 requirements.txt  Dependencies
 .env.example      Config template (copy to .env; never commit .env)
 ```
+
+<!-- contributors: sole author hspb2024 -->
